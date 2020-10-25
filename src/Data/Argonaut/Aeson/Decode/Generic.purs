@@ -11,6 +11,7 @@ import Prelude
 import Control.Alt ((<|>))
 import Data.Argonaut.Aeson.Options (Options(Options), SumEncoding(..))
 import Data.Argonaut.Core (Json, caseJson, fromBoolean, fromNumber, fromObject, fromString, jsonNull, toObject, toString)
+import Data.Argonaut.Decode.Error (JsonDecodeError(..))
 import Data.Argonaut.Decode.Generic.Rep (class DecodeRepArgs, decodeRepArgs)
 import Data.Array (singleton)
 import Data.Bifunctor (lmap)
@@ -21,10 +22,10 @@ import Foreign.Object as SM
 import Data.Symbol (class IsSymbol, SProxy(..), reflectSymbol)
 
 class DecodeAeson r where
-  decodeAeson :: Options -> Json -> Either String r
+  decodeAeson :: Options -> Json -> Either JsonDecodeError r
 
 instance decodeAesonNoConstructors :: DecodeAeson Rep.NoConstructors where
-  decodeAeson _ _ = Left "Cannot decode empty data type"
+  decodeAeson _ _ = Left $ TypeMismatch "Cannot decode empty data type"
 
 instance decodeAesonSum :: DecodeAeson' (Rep.Sum a b) => DecodeAeson (Rep.Sum a b) where
   decodeAeson = decodeAeson'
@@ -35,15 +36,14 @@ instance decodeAesonConstructor :: (IsSymbol name, DecodeRepArgs a) => DecodeAes
     then decodeAeson' (Options options) j
     else do
       let name = reflectSymbol (SProxy :: SProxy name)
-      let decodingErr msg = "When decoding a " <> name <> ": " <> msg
-      {init, rest} <- let values = toJsonArray j in lmap decodingErr $ decodeRepArgs values
+      {init, rest} <- let values = toJsonArray j in lmap (Named name) $ decodeRepArgs values
       pure $ Rep.Constructor init
 
 class DecodeAeson' r where
-  decodeAeson' :: Options -> Json -> Either String r
+  decodeAeson' :: Options -> Json -> Either JsonDecodeError r
 
 instance decodeAesonNoConstructors' :: DecodeAeson' Rep.NoConstructors where
-  decodeAeson' _ _ = Left "Cannot decode empty data type"
+  decodeAeson' _ _ = Left $ TypeMismatch "Cannot decode empty data type"
 
 instance decodeAesonSum' :: (DecodeAeson' a, DecodeAeson' b) => DecodeAeson' (Rep.Sum a b) where
   decodeAeson' o j = Rep.Inl <$> decodeAeson' o j <|> Rep.Inr <$> decodeAeson' o j
@@ -60,21 +60,20 @@ toJsonArray = caseJson
 instance decodeAesonConstructor' :: (IsSymbol name, DecodeRepArgs a) => DecodeAeson' (Rep.Constructor name a) where
   decodeAeson' (Options { sumEncoding: TaggedObject r }) j = do
     let name = reflectSymbol (SProxy :: SProxy name)
-    let decodingErr msg = "When decoding a " <> name <> ": " <> msg
-    jObj <- note (decodingErr "expected an object") (toObject j)
-    jTag <- note (decodingErr (show r.tagFieldName <> " property is missing")) (SM.lookup r.tagFieldName jObj)
-    tag <- note (decodingErr (show r.tagFieldName <> " property is not a string")) (toString jTag)
+    jObj <- note (Named name $ TypeMismatch "object expected") (toObject j)
+    jTag <- note (Named name $ AtKey r.tagFieldName $ MissingValue) (SM.lookup r.tagFieldName jObj)
+    tag <- note (Named name $ AtKey r.tagFieldName $ TypeMismatch "string expected") (toString jTag)
     when (tag /= name) $
-      Left $ decodingErr "'tag' property has an incorrect value"
+      Left $ Named name $ AtKey "tag" $ UnexpectedValue (fromString tag)
     {init, rest} <- case SM.lookup r.contentsFieldName jObj of
       Just jValue ->
         let values = toJsonArray jValue
-        in lmap decodingErr $ decodeRepArgs values
+        in lmap (Named name) $ decodeRepArgs values
       Nothing -> do
         let jObj' = SM.delete r.tagFieldName jObj
-        lmap decodingErr $ decodeRepArgs $ singleton (fromObject jObj')
+        lmap (Named name) $ decodeRepArgs $ singleton (fromObject jObj')
     pure $ Rep.Constructor init
 
 -- | Decode `Json` Aeson representation of a value which has a `Generic` type.
-genericDecodeAeson :: forall a r. Rep.Generic a r => DecodeAeson r => Options -> Json -> Either String a
+genericDecodeAeson :: forall a r. Rep.Generic a r => DecodeAeson r => Options -> Json -> Either JsonDecodeError a
 genericDecodeAeson o = map Rep.to <<< decodeAeson o
